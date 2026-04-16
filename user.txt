@@ -1,0 +1,4 @@
+superadmin@monc.local` | `password123` | Superadmin |
+| `admin@monc.local` | `password123` | Admin IT |
+| `operator@monc.local` | `password123` | Operator |
+| `auditor@monc.local` | `password123` | Auditor
