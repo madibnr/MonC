@@ -29,9 +29,6 @@
     <!-- Alpine.js -->
     <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
 
-    <!-- HLS.js -->
-    <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
-
     <style>
         [x-cloak] { display: none !important; }
 

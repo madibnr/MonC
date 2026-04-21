@@ -5,7 +5,6 @@ namespace App\Services;
 use App\Models\Camera;
 use App\Models\StreamSession;
 use Illuminate\Support\Facades\Log;
-use Symfony\Component\Process\Process;
 
 class FFmpegStreamService
 {
@@ -21,90 +20,102 @@ class FFmpegStreamService
 
     /**
      * Start HLS stream for a camera
+     *
+     * @param  string  $streamType  'sub' for sub-stream (default), 'main' for main stream
      */
-    public function startStream(Camera $camera, ?int $userId = null): ?StreamSession
+    public function startStream(Camera $camera, ?int $userId = null, string $streamType = 'sub'): ?StreamSession
     {
-        // Check if stream is already active
+        // Check if stream is already active with the same type
         $existingSession = StreamSession::where('camera_id', $camera->id)
             ->where('status', 'active')
             ->first();
 
         if ($existingSession && $this->isProcessRunning($existingSession->pid)) {
-            return $existingSession;
+            // If requesting different stream type, stop existing and start new
+            $existingType = $existingSession->stream_path;
+            $expectedPath = $streamType === 'main'
+                ? "streams/camera_{$camera->id}_main/index.m3u8"
+                : "streams/camera_{$camera->id}/index.m3u8";
+
+            if ($existingType === $expectedPath) {
+                return $existingSession;
+            }
+
+            // Stop existing stream to switch type
+            $this->stopStream($camera->id);
         }
 
         // Clean up any stale sessions for this camera
         $this->cleanupStaleSessions($camera->id);
 
-        // Create output directory
-        $outputDir = $this->getOutputDir($camera->id);
+        // Create output directory (separate dirs for main vs sub)
+        $dirSuffix = $streamType === 'main' ? '_main' : '';
+        $outputDir = $this->outputBasePath."/camera_{$camera->id}{$dirSuffix}";
         if (! is_dir($outputDir)) {
             mkdir($outputDir, 0755, true);
         }
 
         $outputPath = $outputDir.'/index.m3u8';
-        $streamUrl = $camera->getSubStreamUrl();
+        $streamUrl = $streamType === 'main'
+            ? $camera->getMainStreamUrl()
+            : $camera->getSubStreamUrl();
 
         if (! $streamUrl) {
-            Log::error("No stream URL available for camera {$camera->id}");
+            Log::error("No stream URL available for camera {$camera->id} ({$streamType})");
 
             return null;
         }
 
-        // Build FFmpeg command
-        $command = [
-            $this->ffmpegPath,
-            '-rtsp_transport', 'tcp',
-            '-i', $streamUrl,
-            '-c:v', 'copy',
-            '-c:a', 'aac',
-            '-f', 'hls',
-            '-hls_time', '2',
-            '-hls_list_size', '10',
-            '-hls_flags', 'delete_segments+append_list',
-            '-hls_allow_cache', '0',
-            '-hls_segment_filename', $outputDir.'/segment_%03d.ts',
-            '-y',
-            $outputPath,
-        ];
+        // Build FFmpeg command line string
+        $cmdLine = '"'.$this->ffmpegPath.'"'
+            .' -rtsp_transport tcp'
+            .' -i "'.$streamUrl.'"'
+            .' -c:v copy'
+            .' -tag:v hvc1'
+            .' -c:a aac'
+            .' -f hls'
+            .' -hls_time 2'
+            .' -hls_list_size 10'
+            .' -hls_flags delete_segments+append_list'
+            .' -hls_allow_cache 0'
+            .' -hls_segment_filename "'.$outputDir.'/segment_%03d.ts"'
+            .' -y'
+            .' "'.$outputPath.'"';
 
         // Create session record
+        $streamPath = $streamType === 'main'
+            ? "streams/camera_{$camera->id}_main/index.m3u8"
+            : "streams/camera_{$camera->id}/index.m3u8";
+
         $session = StreamSession::create([
             'camera_id' => $camera->id,
             'user_id' => $userId,
-            'stream_path' => "streams/camera_{$camera->id}/index.m3u8",
+            'stream_path' => $streamPath,
             'status' => 'starting',
             'started_at' => now(),
         ]);
 
         try {
-            // Start FFmpeg process
-            $process = new Process($command);
-            $process->setOptions(['create_new_console' => true]);
-            $process->setTimeout(null);
-            $process->start();
+            // Start FFmpeg as a detached background process
+            $pid = $this->startBackgroundProcess($cmdLine);
 
-            // Wait briefly to check if process started successfully
-            usleep(500000); // 0.5 seconds
-
-            if ($process->isRunning()) {
+            if ($pid) {
                 $session->update([
-                    'pid' => $process->getPid(),
+                    'pid' => $pid,
                     'status' => 'active',
                 ]);
 
-                Log::info("Stream started for camera {$camera->id}, PID: {$process->getPid()}");
+                Log::info("Stream started for camera {$camera->id}, PID: {$pid}");
 
                 return $session;
             } else {
-                $errorOutput = $process->getErrorOutput();
                 $session->update([
                     'status' => 'error',
-                    'error_message' => $errorOutput,
+                    'error_message' => 'Failed to spawn FFmpeg process',
                     'stopped_at' => now(),
                 ]);
 
-                Log::error("Failed to start stream for camera {$camera->id}: {$errorOutput}");
+                Log::error("Failed to spawn FFmpeg process for camera {$camera->id}");
 
                 return null;
             }
@@ -119,6 +130,72 @@ class FFmpegStreamService
 
             return null;
         }
+    }
+
+    /**
+     * Start a process in the background (fully detached from PHP).
+     * Returns the PID on success, or null on failure.
+     */
+    protected function startBackgroundProcess(string $cmdLine): ?int
+    {
+        $logFile = storage_path('logs/ffmpeg_stream.log');
+
+        if (strtoupper(substr(PHP_OS, 0, 3)) === 'WIN') {
+            // On Windows: use proc_open with start /B and create_process_group
+            $descriptors = [
+                0 => ['file', 'NUL', 'r'],
+                1 => ['file', 'NUL', 'w'],
+                2 => ['file', $logFile, 'w'],
+            ];
+
+            $options = [
+                'create_process_group' => true,
+                'create_new_console' => false,
+                'suppress_errors' => true,
+            ];
+
+            $process = proc_open('start "" /B '.$cmdLine, $descriptors, $pipes, null, null, $options);
+
+            if (is_resource($process)) {
+                // Wait for FFmpeg to actually start
+                sleep(3);
+
+                // Find the FFmpeg PID via tasklist
+                $pid = $this->findFfmpegPid();
+
+                // Close the proc resource (does NOT kill detached process)
+                proc_close($process);
+
+                return $pid;
+            }
+
+            return null;
+        }
+
+        // On Linux/Mac, use nohup
+        $fullCmd = "nohup {$cmdLine} > /dev/null 2>&1 & echo $!";
+        $output = [];
+        exec($fullCmd, $output);
+        $pid = (int) ($output[0] ?? 0);
+
+        return $pid > 0 ? $pid : null;
+    }
+
+    /**
+     * Find the PID of a running ffmpeg.exe process.
+     */
+    protected function findFfmpegPid(): ?int
+    {
+        $output = [];
+        exec('tasklist /FI "IMAGENAME eq ffmpeg.exe" /FO CSV /NH 2>NUL', $output);
+
+        foreach ($output as $line) {
+            if (preg_match('/"ffmpeg\.exe","(\d+)"/', $line, $matches)) {
+                return (int) $matches[1];
+            }
+        }
+
+        return null;
     }
 
     /**
@@ -266,16 +343,22 @@ class FFmpegStreamService
     }
 
     /**
-     * Clean up HLS files for a camera
+     * Clean up HLS files for a camera (both sub and main stream dirs)
      */
     protected function cleanupStreamFiles(int $cameraId): void
     {
-        $dir = $this->getOutputDir($cameraId);
-        if (is_dir($dir)) {
-            $files = glob($dir.'/*');
-            foreach ($files as $file) {
-                if (is_file($file)) {
-                    unlink($file);
+        $dirs = [
+            $this->outputBasePath."/camera_{$cameraId}",
+            $this->outputBasePath."/camera_{$cameraId}_main",
+        ];
+
+        foreach ($dirs as $dir) {
+            if (is_dir($dir)) {
+                $files = glob($dir.'/*');
+                foreach ($files as $file) {
+                    if (is_file($file)) {
+                        unlink($file);
+                    }
                 }
             }
         }

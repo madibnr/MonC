@@ -5,7 +5,7 @@ namespace App\Http\Controllers;
 use App\Models\ActivityLog;
 use App\Models\Building;
 use App\Models\Camera;
-use App\Services\FFmpegStreamService;
+use App\Services\Go2rtcStreamService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
@@ -14,7 +14,7 @@ use Illuminate\View\View;
 class LiveViewController extends Controller
 {
     public function __construct(
-        protected FFmpegStreamService $streamService
+        protected Go2rtcStreamService $streamService
     ) {}
 
     /**
@@ -54,14 +54,15 @@ class LiveViewController extends Controller
         }
 
         $buildings = Building::orderBy('name')->get();
+        $go2rtcApiUrl = $this->streamService->getApiUrl();
 
-        return view('live.index', compact('cameras', 'buildings', 'currentLayout'));
+        return view('live.index', compact('cameras', 'buildings', 'currentLayout', 'go2rtcApiUrl'));
     }
 
     /**
-     * Start an FFmpeg stream for a camera and return the HLS URL.
+     * Start a stream for a camera via go2rtc and return connection URLs.
      */
-    public function stream(Camera $camera): JsonResponse
+    public function stream(Request $request, Camera $camera): JsonResponse
     {
         $user = Auth::user();
 
@@ -72,15 +73,22 @@ class LiveViewController extends Controller
             ], 403);
         }
 
+        $streamType = $request->input('stream_type', 'sub');
+        if (! in_array($streamType, ['main', 'sub'])) {
+            $streamType = 'sub';
+        }
+
         try {
-            $session = $this->streamService->startStream($camera, $user->id);
+            $session = $this->streamService->startStream($camera, $user->id, $streamType);
 
             if (! $session) {
                 return response()->json([
                     'success' => false,
-                    'message' => 'Failed to start stream. Check camera configuration.',
+                    'message' => 'Failed to start stream. Check camera configuration or go2rtc status.',
                 ], 500);
             }
+
+            $streamName = $session->stream_path;
 
             ActivityLog::log('stream_started', "Started live stream for camera '{$camera->name}'", [
                 'camera_id' => $camera->id,
@@ -90,7 +98,9 @@ class LiveViewController extends Controller
             return response()->json([
                 'success' => true,
                 'camera_id' => $camera->id,
-                'stream_url' => asset('storage/'.$session->stream_path),
+                'stream_name' => $streamName,
+                'mse_url' => $this->streamService->getMseWsUrl($streamName),
+                'webrtc_url' => $this->streamService->getWebRtcUrl($streamName),
                 'session_id' => $session->id,
             ]);
         } catch (\Exception $e) {
@@ -102,7 +112,7 @@ class LiveViewController extends Controller
     }
 
     /**
-     * Stop an FFmpeg stream for a camera.
+     * Stop a stream for a camera.
      */
     public function stopStream(Camera $camera): JsonResponse
     {

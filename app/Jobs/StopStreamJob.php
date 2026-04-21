@@ -2,7 +2,7 @@
 
 namespace App\Jobs;
 
-use App\Services\FFmpegStreamService;
+use App\Services\Go2rtcStreamService;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
@@ -22,7 +22,7 @@ class StopStreamJob implements ShouldQueue
         protected int $cameraId
     ) {}
 
-    public function handle(FFmpegStreamService $service): void
+    public function handle(Go2rtcStreamService $service): void
     {
         $service->stopStream($this->cameraId);
         Log::info("StopStreamJob: Stream stopped for camera {$this->cameraId}");

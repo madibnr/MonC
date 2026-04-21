@@ -2,7 +2,7 @@
 
 namespace App\Jobs;
 
-use App\Services\FFmpegStreamService;
+use App\Services\Go2rtcStreamService;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
@@ -18,7 +18,7 @@ class CleanupStaleStreamsJob implements ShouldQueue
 
     public int $timeout = 60;
 
-    public function handle(FFmpegStreamService $service): void
+    public function handle(Go2rtcStreamService $service): void
     {
         $service->cleanupStaleSessions();
         Log::info('CleanupStaleStreamsJob: Stale streams cleaned up.');

@@ -3,7 +3,7 @@
 namespace App\Jobs;
 
 use App\Models\Camera;
-use App\Services\FFmpegStreamService;
+use App\Services\Go2rtcStreamService;
 use Illuminate\Bus\Queueable;
 use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
@@ -24,7 +24,7 @@ class StartStreamJob implements ShouldQueue
         protected ?int $userId = null
     ) {}
 
-    public function handle(FFmpegStreamService $service): void
+    public function handle(Go2rtcStreamService $service): void
     {
         $camera = Camera::find($this->cameraId);
 

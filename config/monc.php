@@ -3,7 +3,21 @@
 return [
     /*
     |--------------------------------------------------------------------------
-    | FFmpeg Configuration
+    | go2rtc Configuration
+    |--------------------------------------------------------------------------
+    | go2rtc is a zero-dependency streaming server bundled with MonC.
+    | It handles RTSP → MSE/WebRTC transcoding with sub-second latency.
+    | No FFmpeg installation required for live preview.
+    */
+    'go2rtc' => [
+        'binary_path' => env('GO2RTC_BINARY_PATH', base_path('bin/go2rtc.exe')),
+        'config_path' => env('GO2RTC_CONFIG_PATH', base_path('bin/go2rtc.yaml')),
+        'api_url' => env('GO2RTC_API_URL', 'http://127.0.0.1:1984'),
+    ],
+
+    /*
+    |--------------------------------------------------------------------------
+    | FFmpeg Configuration (used for snapshots, exports, AI frame capture)
     |--------------------------------------------------------------------------
     */
     'ffmpeg_path' => env('FFMPEG_PATH', 'ffmpeg'),
@@ -15,11 +29,8 @@ return [
     |--------------------------------------------------------------------------
     */
     'stream' => [
-        'hls_time' => env('HLS_SEGMENT_TIME', 2),
-        'hls_list_size' => env('HLS_LIST_SIZE', 10),
         'default_transport' => env('RTSP_TRANSPORT', 'tcp'),
         'use_sub_stream' => env('USE_SUB_STREAM', true),
-        'output_path' => env('STREAM_OUTPUT_PATH', storage_path('app/public/streams')),
     ],
 
     /*
