@@ -70,6 +70,11 @@
                         </td>
                         <td class="px-4 py-3">
                             <div class="flex items-center gap-2">
+                                <a href="{{ route('cameras.show', $camera) }}" class="text-slate-500 hover:text-slate-700 text-sm" title="View"><i class="fas fa-eye"></i></a>
+                                <form method="POST" action="{{ route('cameras.check-status', $camera) }}" style="display: inline;">
+                                    @csrf
+                                    <button type="submit" class="text-blue-500 hover:text-blue-700 text-sm" title="Check status"><i class="fas fa-sync-alt"></i></button>
+                                </form>
                                 <a href="{{ route('cameras.edit', $camera) }}" class="text-blue-500 hover:text-blue-700 text-sm" title="Edit"><i class="fas fa-edit"></i></a>
                                 <form method="POST" action="{{ route('cameras.destroy', $camera) }}" onsubmit="return confirm('Are you sure you want to delete this camera?')">
                                     @csrf @method('DELETE')

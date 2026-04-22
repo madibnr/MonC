@@ -36,11 +36,9 @@ class NvrHealthService
 
         // Try to get system status via ISAPI
         try {
-            $baseUrl = "http://{$nvr->ip_address}";
-            $timeout = 10;
-
-            // Get HDD status
-            $hddData = $this->getIsapiData($nvr, '/ISAPI/ContentMgmt/Storage');
+            // Get HDD status (try multiple known Hikvision endpoints)
+            $hddData = $this->getIsapiData($nvr, '/ISAPI/ContentMgmt/Storage')
+                    ?? $this->getIsapiData($nvr, '/ISAPI/ContentMgmt/Storage/hdd');
             // Get system status
             $systemData = $this->getIsapiData($nvr, '/ISAPI/System/status');
             // Get device info
@@ -145,17 +143,31 @@ class NvrHealthService
 
     /**
      * Get data from Hikvision ISAPI endpoint.
+     * Hikvision NVRs use digest authentication (not basic auth).
      */
     protected function getIsapiData(Nvr $nvr, string $endpoint): ?string
     {
-        try {
-            $response = Http::withBasicAuth($nvr->username, $nvr->password)
-                ->timeout(10)
-                ->get("http://{$nvr->ip_address}{$endpoint}");
+        $url = "http://{$nvr->ip_address}{$endpoint}";
 
-            if ($response->successful()) {
-                return $response->body();
+        try {
+            // Use cURL directly for digest auth support
+            $ch = curl_init($url);
+            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($ch, CURLOPT_TIMEOUT, 10);
+            curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 5);
+            curl_setopt($ch, CURLOPT_HTTPAUTH, CURLAUTH_DIGEST | CURLAUTH_BASIC);
+            curl_setopt($ch, CURLOPT_USERPWD, "{$nvr->username}:{$nvr->password}");
+
+            $body = curl_exec($ch);
+            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            $error = curl_error($ch);
+            curl_close($ch);
+
+            if ($httpCode >= 200 && $httpCode < 300 && $body) {
+                return $body;
             }
+
+            Log::debug("ISAPI {$nvr->name}{$endpoint}: HTTP {$httpCode}" . ($error ? " — {$error}" : ''));
         } catch (\Exception $e) {
             Log::debug("ISAPI request failed for {$nvr->name}{$endpoint}: {$e->getMessage()}");
         }
@@ -213,9 +225,13 @@ class NvrHealthService
      */
     protected function getRecordingChannels(Nvr $nvr): int
     {
-        $data = $this->getIsapiData($nvr, '/ISAPI/ContentMgmt/record/control/manual/status');
+        // Try multiple known Hikvision recording status endpoints
+        $data = $this->getIsapiData($nvr, '/ISAPI/ContentMgmt/record/control/manual/status')
+             ?? $this->getIsapiData($nvr, '/ISAPI/ContentMgmt/record/status');
+
         if (! $data) {
-            return 0;
+            // Fallback: if NVR is reachable and has cameras, assume recording
+            return $nvr->cameras()->active()->count();
         }
 
         // Count recording channels from response

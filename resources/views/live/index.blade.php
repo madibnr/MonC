@@ -192,20 +192,47 @@
 @endsection
 
 @section('scripts')
-{{-- Load go2rtc VideoRTC player directly from go2rtc server --}}
-<script type="module">
-import {VideoRTC} from '{{ $go2rtcApiUrl }}/video-rtc.js';
+{{-- go2rtc module loader with retry --}}
+<script>
+(function() {
+    var go2rtcUrl = @json($go2rtcApiUrl);
 
-// Make VideoRTC available globally for Alpine.js
-window.VideoRTC = VideoRTC;
-window.go2rtcReady = true;
+    function loadGo2rtc() {
+        var script = document.createElement('script');
+        script.type = 'module';
+        script.textContent = 'import {VideoRTC} from "' + go2rtcUrl + '/video-rtc.js";' +
+            'window.VideoRTC = VideoRTC;' +
+            'window.go2rtcReady = true;' +
+            'window.dispatchEvent(new Event("go2rtc-ready"));';
+        document.head.appendChild(script);
+    }
 
-// Dispatch event so Alpine knows it's ready
-window.dispatchEvent(new Event('go2rtc-ready'));
+    // Try to load immediately
+    loadGo2rtc();
+
+    // Retry every 5 seconds if not loaded
+    var retryInterval = setInterval(function() {
+        if (window.go2rtcReady) {
+            clearInterval(retryInterval);
+            return;
+        }
+        // Check if go2rtc is reachable before retrying
+        fetch(go2rtcUrl + '/api', { signal: AbortSignal.timeout(3000) })
+            .then(function(res) {
+                if (res.ok && !window.go2rtcReady) {
+                    loadGo2rtc();
+                }
+            })
+            .catch(function() {});
+    }, 5000);
+})();
 </script>
 
 <script>
 function liveMonitor() {
+    const CSRF = document.querySelector('meta[name="csrf-token"]').content;
+    const HDR  = { 'Content-Type':'application/json', 'X-CSRF-TOKEN':CSRF, 'Accept':'application/json' };
+
     return {
         cameras: @json($cameras->map(function($cam) {
             $data = $cam->toArray();
@@ -226,42 +253,44 @@ function liveMonitor() {
         focusCameraId: null,
         previousLayout: null,
         previousFilteredCameras: [],
+        previousActiveIds: [],
         clickTimer: null,
-        
+
+        // ── Lifecycle ───────────────────────────────────────────
         init() {
             this.filteredCameras = [...this.cameras];
             this.checkGo2rtcStatus();
             setInterval(() => this.checkGo2rtcStatus(), 15000);
 
-            // Wait for VideoRTC module to load
             if (window.go2rtcReady) {
                 this.go2rtcLoaded = true;
             } else {
-                window.addEventListener('go2rtc-ready', () => {
-                    this.go2rtcLoaded = true;
-                });
+                window.addEventListener('go2rtc-ready', () => { this.go2rtcLoaded = true; });
             }
 
             document.addEventListener('keydown', (e) => {
-                if (e.key === 'Escape' && this.focusCameraId) {
-                    this.exitFocusMode();
-                }
+                if (e.key === 'Escape' && this.focusCameraId) this.exitFocusMode();
+            });
+
+            // Cleanup on page unload
+            window.addEventListener('beforeunload', () => {
+                Object.keys(this.videoElements).forEach(id => this.destroyVideoElement(id));
             });
         },
 
         async checkGo2rtcStatus() {
             try {
-                const res = await fetch(this.go2rtcApiUrl + '/api');
+                const res = await fetch(this.go2rtcApiUrl + '/api', { signal: AbortSignal.timeout(3000) });
                 this.go2rtcOnline = res.ok;
             } catch {
                 this.go2rtcOnline = false;
+                try { await fetch('/live/go2rtc-start', { method:'POST', headers:HDR }); } catch {}
             }
+            if (window.go2rtcReady) this.go2rtcLoaded = true;
         },
-        
-        get paginatedCameras() {
-            return this.filteredCameras.slice(0, this.currentLayout);
-        },
-        
+
+        // ── Grid helpers ────────────────────────────────────────
+        get paginatedCameras() { return this.filteredCameras.slice(0, this.currentLayout); },
         get gridCols() {
             if (this.currentLayout <= 1) return 1;
             if (this.currentLayout <= 4) return 2;
@@ -269,406 +298,293 @@ function liveMonitor() {
             if (this.currentLayout <= 16) return 4;
             return 8;
         },
-
-        get gridRows() {
-            return Math.ceil(this.currentLayout / this.gridCols);
-        },
-
-        get gridGap() {
-            return this.currentLayout <= 16 ? 4 : 2;
-        },
-
+        get gridRows() { return Math.ceil(this.currentLayout / this.gridCols); },
+        get gridGap()  { return this.currentLayout <= 16 ? 4 : 2; },
         get gridStyle() {
-            const cols = this.gridCols;
-            const rows = this.gridRows;
-            const gap = this.gridGap;
-
-            if (this.isFullscreen) {
-                // Fullscreen: fill entire viewport, rows divide height evenly
-                return `display:grid; grid-template-columns: repeat(${cols}, 1fr); grid-template-rows: repeat(${rows}, 1fr); gap: ${gap}px; height: 100%;`;
-            }
-
-            // Normal mode: use aspect-ratio based height via padding trick
-            return `display:grid; grid-template-columns: repeat(${cols}, 1fr); gap: ${gap}px;`;
+            const c = this.gridCols, r = this.gridRows, g = this.gridGap;
+            if (this.isFullscreen)
+                return `display:grid;grid-template-columns:repeat(${c},1fr);grid-template-rows:repeat(${r},1fr);gap:${g}px;height:100%`;
+            return `display:grid;grid-template-columns:repeat(${c},1fr);gap:${g}px`;
         },
+        get cellStyle() { return this.isFullscreen ? '' : 'aspect-ratio:16/9'; },
 
-        get cellStyle() {
-            // In fullscreen the grid rows handle sizing, no aspect-ratio needed
-            if (this.isFullscreen) return '';
-            // Normal mode: maintain 16:9 aspect ratio
-            return 'aspect-ratio: 16/9;';
-        },
-        
         filterCameras() {
-            if (this.selectedBuilding) {
-                this.filteredCameras = this.cameras.filter(c => c.building_id == this.selectedBuilding);
-            } else {
-                this.filteredCameras = [...this.cameras];
-            }
+            this.filteredCameras = this.selectedBuilding
+                ? this.cameras.filter(c => c.building_id == this.selectedBuilding)
+                : [...this.cameras];
         },
-        
-        setLayout(layout) {
-            this.currentLayout = layout;
-        },
-        
+        setLayout(l) { this.currentLayout = l; },
+        toggleFullscreen() { this.isFullscreen = !this.isFullscreen; },
+
+        // ── Stream control ──────────────────────────────────────
         async toggleStream(camera) {
-            if (this.clickTimer) {
-                clearTimeout(this.clickTimer);
-                this.clickTimer = null;
-                return;
-            }
+            if (this.clickTimer) { clearTimeout(this.clickTimer); this.clickTimer = null; return; }
             this.clickTimer = setTimeout(async () => {
                 this.clickTimer = null;
-                if (this.activeStreams[camera.id]) {
-                    await this.stopStream(camera.id);
-                } else {
-                    await this.startStream(camera.id);
-                }
+                this.activeStreams[camera.id] ? await this.stopStream(camera.id) : await this.startStream(camera.id);
             }, 250);
         },
-        
-        /**
-         * Start stream: register in go2rtc via Laravel, then create VideoRTC element.
-         */
-        async startStream(cameraId, streamType = 'sub') {
-            if (!this.go2rtcLoaded) {
-                alert('go2rtc player is still loading. Please wait.');
-                return;
-            }
 
-            this.loadingStreams[cameraId] = true;
-            
+        async startStream(cameraId, streamType = 'sub') {
+            if (!this.go2rtcLoaded) { console.warn('go2rtc not ready'); return false; }
+
+            this.loadingStreams = { ...this.loadingStreams, [cameraId]: true };
             try {
-                // 1. Register stream in go2rtc via Laravel backend
-                const response = await fetch(`/live/stream/${cameraId}`, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]').content,
-                        'Accept': 'application/json',
-                    },
-                    body: JSON.stringify({ stream_type: streamType }),
-                });
-                
-                const data = await response.json();
-                
-                if (data.success && data.stream_name) {
-                    this.activeStreams[cameraId] = true;
-                    
-                    await this.$nextTick();
-                    
-                    // 2. Create go2rtc VideoRTC player element
-                    this.createVideoElement(cameraId, data.stream_name);
-                } else {
-                    alert(data.message || 'Failed to start stream');
-                }
-            } catch (error) {
-                console.error('Stream error:', error);
-                alert('Failed to connect to stream');
-            } finally {
-                this.loadingStreams[cameraId] = false;
-            }
+                const res = await fetch(`/live/stream/${cameraId}`, { method:'POST', headers:HDR, body:JSON.stringify({ stream_type: streamType }) });
+                const data = await res.json();
+                if (!data.success || !data.stream_name) { console.error(`Stream ${cameraId}:`, data.message); return false; }
+
+                this.activeStreams = { ...this.activeStreams, [cameraId]: true };
+
+                // Wait for Alpine to render the video container
+                await this.$nextTick();
+                await new Promise(r => requestAnimationFrame(r));
+
+                this.createVideoElement(cameraId, data.stream_name);
+                return true;
+            } catch (e) { console.error(`Stream ${cameraId}:`, e); return false; }
+            finally { this.loadingStreams = { ...this.loadingStreams, [cameraId]: false }; }
         },
 
-        /**
-         * Create a VideoRTC custom element and attach it to the container.
-         */
+        async stopStream(cameraId) {
+            this.destroyVideoElement(cameraId);
+            this.activeStreams = { ...this.activeStreams, [cameraId]: false };
+            try { await fetch(`/live/stream/${cameraId}`, { method:'DELETE', headers:HDR }); } catch {}
+        },
+
+        // ── MSE Video Player ────────────────────────────────────
         createVideoElement(cameraId, streamName) {
             const container = document.getElementById('video-container-' + cameraId);
-            if (!container) return;
+            if (!container) {
+                // Container not yet rendered by Alpine, retry once after a short delay
+                setTimeout(() => {
+                    const c = document.getElementById('video-container-' + cameraId);
+                    if (c && this.activeStreams[cameraId]) {
+                        this._buildPlayer(cameraId, streamName, c);
+                    }
+                }, 200);
+                return;
+            }
+            this._buildPlayer(cameraId, streamName, container);
+        },
 
-            // Clean up existing
+        _buildPlayer(cameraId, streamName, container) {
             this.destroyVideoElement(cameraId);
 
-            // Create a video element manually and use go2rtc WebSocket
             const video = document.createElement('video');
             video.autoplay = true;
             video.playsInline = true;
             video.muted = true;
             video.controls = false;
-            video.style.width = '100%';
-            video.style.height = '100%';
-            video.style.objectFit = 'contain';
-            video.style.display = 'block';
+            Object.assign(video.style, { width:'100%', height:'100%', objectFit:'contain', display:'block' });
             container.appendChild(video);
 
-            // Connect via go2rtc MSE WebSocket
-            const wsUrl = this.go2rtcApiUrl.replace('http', 'ws') + '/api/ws?src=' + encodeURIComponent(streamName);
-            const ws = new WebSocket(wsUrl);
-            ws.binaryType = 'arraybuffer';
-
-            const CODECS = [
-                'avc1.640029', 'avc1.64002A', 'avc1.640033',
-                'hvc1.1.6.L153.B0',
-                'mp4a.40.2', 'mp4a.40.5', 'flac', 'opus',
-            ];
+            const wsUrl = this.go2rtcApiUrl.replace('http','ws') + '/api/ws?src=' + encodeURIComponent(streamName);
+            const self = this;
+            let ws, ms, sb, buf, bufLen = 0, reconnectTimer = null;
 
             function getCodecs() {
                 const MS = window.ManagedMediaSource || window.MediaSource;
                 if (!MS) return '';
-                return CODECS
-                    .filter(c => MS.isTypeSupported(`video/mp4; codecs="${c}"`))
-                    .join();
+                return ['avc1.640029','avc1.64002A','avc1.640033','hvc1.1.6.L153.B0','mp4a.40.2','mp4a.40.5','flac','opus']
+                    .filter(c => MS.isTypeSupported(`video/mp4; codecs="${c}"`)).join();
             }
 
-            let ms, sb, buf, bufLen = 0;
+            function connect() {
+                ws = new WebSocket(wsUrl);
+                ws.binaryType = 'arraybuffer';
 
-            ws.onopen = () => {
-                console.log(`[go2rtc] WS open: camera ${cameraId}`);
+                ws.onopen = () => {
+                    const MS = window.ManagedMediaSource || window.MediaSource;
+                    ms = new MS();
+                    ms.addEventListener('sourceopen', () => {
+                        ws.send(JSON.stringify({ type:'mse', value:getCodecs() }));
+                    }, { once:true });
 
-                // Create MediaSource first, send codecs after sourceopen
-                const MS = window.ManagedMediaSource || window.MediaSource;
-                ms = new MS();
-
-                ms.addEventListener('sourceopen', () => {
-                    // Send supported codecs to go2rtc
-                    ws.send(JSON.stringify({ type: 'mse', value: getCodecs() }));
-                }, { once: true });
-
-                if (window.ManagedMediaSource) {
-                    video.disableRemotePlayback = true;
-                    video.srcObject = ms;
-                } else {
-                    video.src = URL.createObjectURL(ms);
-                    video.srcObject = null;
-                }
-
-                video.play().catch(e => {
-                    if (!video.muted) {
-                        video.muted = true;
-                        video.play().catch(() => {});
+                    if (window.ManagedMediaSource) {
+                        video.disableRemotePlayback = true;
+                        video.srcObject = ms;
+                    } else {
+                        video.src = URL.createObjectURL(ms);
+                        video.srcObject = null;
                     }
-                });
-            };
+                    video.play().catch(() => { video.muted = true; video.play().catch(() => {}); });
+                };
 
-            ws.onmessage = (ev) => {
-                if (typeof ev.data === 'string') {
-                    const msg = JSON.parse(ev.data);
-                    if (msg.type === 'mse') {
-                        // go2rtc tells us which codec to use
-                        console.log(`[go2rtc] MSE codec: ${msg.value} for camera ${cameraId}`);
-                        try {
-                            sb = ms.addSourceBuffer(msg.value);
-                            sb.mode = 'segments';
+                ws.onmessage = (ev) => {
+                    if (typeof ev.data === 'string') {
+                        const msg = JSON.parse(ev.data);
+                        if (msg.type === 'mse') {
+                            try {
+                                sb = ms.addSourceBuffer(msg.value);
+                                sb.mode = 'segments';
+                                buf = new Uint8Array(2 * 1024 * 1024);
+                                bufLen = 0;
 
-                            buf = new Uint8Array(2 * 1024 * 1024);
-                            bufLen = 0;
-
-                            sb.addEventListener('updateend', () => {
-                                if (!sb.updating && bufLen > 0) {
-                                    try {
-                                        sb.appendBuffer(buf.slice(0, bufLen));
-                                        bufLen = 0;
-                                    } catch (e) {}
-                                }
-
-                                if (!sb.updating && sb.buffered && sb.buffered.length) {
-                                    const end = sb.buffered.end(sb.buffered.length - 1);
-                                    const start = end - 5;
-                                    const start0 = sb.buffered.start(0);
-                                    if (start > start0) {
-                                        sb.remove(start0, start);
-                                        ms.setLiveSeekableRange(start, end);
+                                sb.addEventListener('updateend', () => {
+                                    // Flush pending buffer
+                                    if (!sb.updating && bufLen > 0) {
+                                        try { sb.appendBuffer(buf.slice(0, bufLen)); bufLen = 0; } catch {}
                                     }
-                                    if (video.currentTime < start) {
-                                        video.currentTime = start;
+                                    // Keep only last 5s of buffer to save memory
+                                    if (!sb.updating && sb.buffered && sb.buffered.length) {
+                                        const end = sb.buffered.end(sb.buffered.length - 1);
+                                        const start0 = sb.buffered.start(0);
+                                        if (end - start0 > 10) {
+                                            try { sb.remove(start0, end - 5); } catch {}
+                                        }
+                                        // Jump to live edge if behind
+                                        if (video.currentTime < end - 3) {
+                                            video.currentTime = end - 0.5;
+                                        }
+                                        // Gentle speed correction
+                                        const gap = end - video.currentTime;
+                                        video.playbackRate = gap > 2 ? 1.5 : gap > 0.5 ? 1.1 : 1.0;
                                     }
-                                    // Speed up playback to catch up to live edge
-                                    const gap = end - video.currentTime;
-                                    video.playbackRate = gap > 0.1 ? gap : 0.1;
-                                }
-                            });
-                        } catch (e) {
-                            console.error(`[go2rtc] addSourceBuffer error for camera ${cameraId}:`, e);
+                                });
+                            } catch (e) { console.error(`[MSE] addSourceBuffer ${cameraId}:`, e); }
                         }
-                    } else if (msg.type === 'error') {
-                        console.error(`[go2rtc] Error for camera ${cameraId}:`, msg.value);
-                    }
-                } else {
-                    // Binary data
-                    if (sb) {
+                    } else if (sb) {
                         if (sb.updating || bufLen > 0) {
                             const b = new Uint8Array(ev.data);
-                            buf.set(b, bufLen);
-                            bufLen += b.byteLength;
+                            if (bufLen + b.byteLength <= buf.byteLength) {
+                                buf.set(b, bufLen);
+                                bufLen += b.byteLength;
+                            }
                         } else {
-                            try {
-                                sb.appendBuffer(ev.data);
-                            } catch (e) {}
+                            try { sb.appendBuffer(ev.data); } catch {}
                         }
                     }
-                }
-            };
+                };
 
-            ws.onerror = (e) => console.error(`[go2rtc] WS error: camera ${cameraId}`, e);
-            ws.onclose = () => console.log(`[go2rtc] WS closed: camera ${cameraId}`);
+                ws.onerror = () => {};
+                ws.onclose = () => {
+                    // Auto-reconnect if stream is still supposed to be active
+                    if (self.activeStreams[cameraId] && !reconnectTimer) {
+                        reconnectTimer = setTimeout(() => {
+                            reconnectTimer = null;
+                            if (self.activeStreams[cameraId]) {
+                                console.log(`[WS] Reconnecting camera ${cameraId}...`);
+                                connect();
+                            }
+                        }, 3000);
+                    }
+                };
+            }
 
-            this.videoElements[cameraId] = { video, ws, ms };
+            connect();
+            this.videoElements[cameraId] = { video, getWs: () => ws, getMs: () => ms, reconnectTimer: () => reconnectTimer, cleanup() {
+                if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+                if (ws && ws.readyState <= 1) ws.close();
+                video.pause(); video.src = ''; video.srcObject = null; video.load(); video.remove();
+            }};
         },
 
         destroyVideoElement(cameraId) {
             const el = this.videoElements[cameraId];
             if (!el) return;
-
-            if (el.ws && el.ws.readyState <= 1) el.ws.close();
-            if (el.video) {
-                el.video.pause();
-                el.video.src = '';
-                el.video.srcObject = null;
-                el.video.load();
-                el.video.remove();
-            }
-
+            el.cleanup();
             delete this.videoElements[cameraId];
-
             const container = document.getElementById('video-container-' + cameraId);
             if (container) container.innerHTML = '';
         },
-        
-        async stopStream(cameraId) {
-            try {
-                this.destroyVideoElement(cameraId);
-                
-                await fetch(`/live/stream/${cameraId}`, {
-                    method: 'DELETE',
-                    headers: {
-                        'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]').content,
-                        'Accept': 'application/json',
-                    },
-                });
-                
-                this.activeStreams[cameraId] = false;
-            } catch (error) {
-                console.error('Stop stream error:', error);
-            }
-        },
-        
+
+        // ── Snapshot ────────────────────────────────────────────
         async captureSnapshot(cameraId) {
             try {
-                const response = await fetch('/snapshots/capture', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]').content,
-                        'Accept': 'application/json',
-                    },
-                    body: JSON.stringify({ camera_id: cameraId, from_hls: false }),
-                });
-                const data = await response.json();
+                const res = await fetch('/snapshots/capture', { method:'POST', headers:HDR, body:JSON.stringify({ camera_id:cameraId, from_hls:false }) });
+                const data = await res.json();
                 if (data.success) {
-                    const notif = document.createElement('div');
-                    notif.className = 'fixed bottom-4 right-4 bg-green-500 text-white px-4 py-2 rounded-lg shadow-lg z-[9999] text-sm';
-                    notif.innerHTML = '<i class="fas fa-check mr-2"></i>Snapshot captured: ' + data.snapshot.camera_name;
-                    document.body.appendChild(notif);
-                    setTimeout(() => notif.remove(), 3000);
-                } else {
-                    alert(data.message || 'Failed to capture snapshot');
+                    const n = document.createElement('div');
+                    n.className = 'fixed bottom-4 right-4 bg-green-500 text-white px-4 py-2 rounded-lg shadow-lg z-[9999] text-sm';
+                    n.innerHTML = '<i class="fas fa-check mr-2"></i>Snapshot captured: ' + data.snapshot.camera_name;
+                    document.body.appendChild(n);
+                    setTimeout(() => n.remove(), 3000);
                 }
-            } catch (error) {
-                console.error('Snapshot error:', error);
-                alert('Failed to capture snapshot');
-            }
+            } catch (e) { console.error('Snapshot error:', e); }
         },
-        
+
+        // ── Focus mode (double-click → fullscreen main stream) ─
         async enterFocusMode(camera) {
-            if (this.clickTimer) {
-                clearTimeout(this.clickTimer);
-                this.clickTimer = null;
-            }
+            if (this.clickTimer) { clearTimeout(this.clickTimer); this.clickTimer = null; }
+            if (this.focusCameraId === camera.id) { await this.exitFocusMode(); return; }
+            if (this.focusCameraId) { await this.exitFocusMode(); }
 
-            // If already in focus mode on this camera, exit focus mode
-            if (this.focusCameraId === camera.id) {
-                await this.exitFocusMode();
-                return;
-            }
-
-            // If in focus mode on a different camera, exit first
-            if (this.focusCameraId) {
-                await this.exitFocusMode();
-            }
-
-            // Save current state for restoration
+            // Save state before focus
             this.previousLayout = this.currentLayout;
             this.previousFilteredCameras = [...this.filteredCameras];
+            // Remember which cameras were playing
+            this.previousActiveIds = Object.keys(this.activeStreams).filter(id => this.activeStreams[id]).map(Number);
+
             this.focusCameraId = camera.id;
 
-            // Switch grid to show only this camera in layout=1 (fullscreen)
+            // Destroy all other video elements (their DOM will be removed by Alpine)
+            for (const id of this.previousActiveIds) {
+                if (id !== camera.id) this.destroyVideoElement(id);
+            }
+
+            // Switch to single camera view
             this.filteredCameras = [camera];
             this.currentLayout = 1;
             this.isFullscreen = true;
 
-            // Stop sub-stream and switch to main stream
-            if (this.activeStreams[camera.id]) {
-                this.destroyVideoElement(camera.id);
-                await fetch(`/live/stream/${camera.id}`, {
-                    method: 'DELETE',
-                    headers: {
-                        'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]').content,
-                        'Accept': 'application/json',
-                    },
-                });
-                this.activeStreams[camera.id] = false;
-            }
-
-            // Start main stream
+            // Stop sub-stream, start main stream
+            if (this.activeStreams[camera.id]) await this.stopStream(camera.id);
             await this.startStream(camera.id, 'main');
         },
 
         async exitFocusMode() {
             if (!this.focusCameraId) return;
-            const cameraId = this.focusCameraId;
+            const focusId = this.focusCameraId;
+            const idsToRestore = this.previousActiveIds.filter(id => id !== focusId);
 
-            // Stop main stream
-            if (this.activeStreams[cameraId]) {
-                this.destroyVideoElement(cameraId);
-                await fetch(`/live/stream/${cameraId}`, {
-                    method: 'DELETE',
-                    headers: {
-                        'X-CSRF-TOKEN': document.querySelector('meta[name="csrf-token"]').content,
-                        'Accept': 'application/json',
-                    },
-                });
-                this.activeStreams[cameraId] = false;
-            }
+            // Stop main stream of focused camera
+            if (this.activeStreams[focusId]) await this.stopStream(focusId);
 
-            // Restore previous grid state
-            this.filteredCameras = this.previousFilteredCameras.length > 0
-                ? [...this.previousFilteredCameras]
-                : [...this.cameras];
+            // Restore grid
+            this.filteredCameras = this.previousFilteredCameras.length > 0 ? [...this.previousFilteredCameras] : [...this.cameras];
             this.currentLayout = this.previousLayout || 4;
             this.isFullscreen = false;
             this.focusCameraId = null;
             this.previousLayout = null;
             this.previousFilteredCameras = [];
+            this.previousActiveIds = [];
 
-            // Restart sub stream for the camera
+            // Wait for Alpine to re-render all camera containers
             await this.$nextTick();
-            await this.startStream(cameraId, 'sub');
+            await new Promise(r => requestAnimationFrame(r));
+
+            // Restart all previously active cameras (including the focused one as sub)
+            const allToStart = [focusId, ...idsToRestore];
+            for (const id of allToStart) {
+                try {
+                    await this.startStream(id, 'sub');
+                } catch {}
+                await new Promise(r => setTimeout(r, 150));
+            }
         },
-        
+
+        // ── Play All ────────────────────────────────────────────
         async autoplayAll() {
             this.autoplayingAll = true;
-            for (const camera of this.paginatedCameras) {
-                if (this.activeStreams[camera.id]) continue;
+            const pending = this.paginatedCameras.filter(c => !this.activeStreams[c.id]);
+
+            for (const camera of pending) {
                 try {
                     await this.startStream(camera.id);
-                } catch (e) {
-                    console.error(`Failed to start camera ${camera.id}:`, e);
-                }
-                await new Promise(r => setTimeout(r, 300));
+                } catch {}
+                // Small delay to let browser establish WebSocket before next
+                await new Promise(r => setTimeout(r, 150));
             }
             this.autoplayingAll = false;
         },
-        
+
         async stopAllStreams() {
-            for (const cameraId of Object.keys(this.activeStreams).filter(id => this.activeStreams[id])) {
-                await this.stopStream(cameraId);
-            }
+            const ids = Object.keys(this.activeStreams).filter(id => this.activeStreams[id]);
+            ids.forEach(id => this.destroyVideoElement(id));
+            this.activeStreams = {};
+            await Promise.all(ids.map(id => fetch(`/live/stream/${id}`, { method:'DELETE', headers:HDR }).catch(() => {})));
         },
-        
-        toggleFullscreen() {
-            this.isFullscreen = !this.isFullscreen;
-        }
     };
 }
 </script>

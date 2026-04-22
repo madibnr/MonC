@@ -151,4 +151,61 @@ class CameraController extends Controller
             ->route('cameras.index')
             ->with('success', 'Camera deleted successfully.');
     }
+
+    /**
+     * Check camera status manually using go2rtc (no FFmpeg required).
+     */
+    public function checkStatus(Camera $camera)
+    {
+        try {
+            $go2rtcApiUrl = rtrim(config('monc.go2rtc.api_url', 'http://127.0.0.1:1984'), '/');
+            $streamUrl = $camera->getSubStreamUrl();
+            $streamName = "probe_camera_{$camera->id}";
+
+            // Register stream in go2rtc
+            $putUrl = "{$go2rtcApiUrl}/api/streams?name={$streamName}&src=" . urlencode($streamUrl);
+            $ch = curl_init($putUrl);
+            curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'PUT');
+            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($ch, CURLOPT_TIMEOUT, 5);
+            curl_exec($ch);
+            curl_close($ch);
+
+            // Wait for go2rtc to connect
+            usleep(2000000); // 2 seconds
+
+            // Check if stream has producers
+            $response = \Illuminate\Support\Facades\Http::timeout(5)->get("{$go2rtcApiUrl}/api/streams");
+            $streams = $response->json() ?? [];
+
+            $isOnline = false;
+            if (isset($streams[$streamName])) {
+                $producers = $streams[$streamName]['producers'] ?? [];
+                $isOnline = ! empty($producers);
+            }
+
+            // Cleanup probe stream
+            \Illuminate\Support\Facades\Http::timeout(3)->delete("{$go2rtcApiUrl}/api/streams?name={$streamName}");
+
+            $previousStatus = $camera->status;
+            $camera->update([
+                'status' => $isOnline ? 'online' : 'offline',
+                'last_seen_at' => $isOnline ? now() : $camera->last_seen_at,
+            ]);
+
+            ActivityLog::log('camera_status_checked', "Camera '{$camera->name}' status checked: {$camera->status}", [
+                'camera_id' => $camera->id,
+                'previous_status' => $previousStatus,
+                'current_status' => $camera->status,
+            ]);
+
+            return redirect()
+                ->route('cameras.show', $camera)
+                ->with('success', "Camera status updated: {$camera->status}");
+        } catch (\Exception $e) {
+            return redirect()
+                ->route('cameras.show', $camera)
+                ->with('error', 'Failed to check camera status: ' . $e->getMessage());
+        }
+    }
 }

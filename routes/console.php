@@ -12,6 +12,9 @@ use Illuminate\Support\Facades\Schedule;
 |--------------------------------------------------------------------------
 */
 
+// Ensure go2rtc is running (check every minute)
+Schedule::command('go2rtc:start')->everyMinute()->withoutOverlapping();
+
 Schedule::job(new CleanupStaleStreamsJob)->everyFiveMinutes();
 Schedule::job(new CheckCameraStatusJob)->everyTenMinutes();
 Schedule::job(new CheckNvrHealthJob)->everyThirtyMinutes();

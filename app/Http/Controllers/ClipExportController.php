@@ -122,6 +122,33 @@ class ClipExportController extends Controller
     }
 
     /**
+     * Check queue worker status.
+     */
+    public function queueStatus(): JsonResponse
+    {
+        // Check if there are pending jobs
+        $pendingCount = \DB::table('jobs')->count();
+        
+        // Check if there are any exports in processing status
+        $processingCount = ClipExport::where('status', 'processing')->count();
+        
+        // Check if there are recent completed exports (last 5 minutes)
+        $recentCompleted = ClipExport::where('status', 'completed')
+            ->where('completed_at', '>=', now()->subMinutes(5))
+            ->count();
+
+        // Heuristic: if there are pending jobs but no recent activity, worker might be down
+        $workerActive = $pendingCount === 0 || $processingCount > 0 || $recentCompleted > 0;
+
+        return response()->json([
+            'worker_active' => $workerActive,
+            'pending_jobs' => $pendingCount,
+            'processing_exports' => $processingCount,
+            'recent_completed' => $recentCompleted,
+        ]);
+    }
+
+    /**
      * Download exported clip.
      */
     public function download(ClipExport $clipExport)

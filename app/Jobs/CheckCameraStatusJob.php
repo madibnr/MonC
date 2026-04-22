@@ -11,8 +11,8 @@ use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Foundation\Bus\Dispatchable;
 use Illuminate\Queue\InteractsWithQueue;
 use Illuminate\Queue\SerializesModels;
+use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
-use Symfony\Component\Process\Process;
 
 class CheckCameraStatusJob implements ShouldQueue
 {
@@ -22,12 +22,16 @@ class CheckCameraStatusJob implements ShouldQueue
 
     public int $timeout = 300;
 
+    protected string $go2rtcApiUrl;
+
     public function handle(): void
     {
+        $this->go2rtcApiUrl = rtrim(config('monc.go2rtc.api_url', 'http://127.0.0.1:1984'), '/');
+
         $nvrs = Nvr::active()->with('cameras')->get();
 
         foreach ($nvrs as $nvr) {
-            // Check NVR reachability
+            // Check NVR reachability via RTSP port
             $nvrOnline = $this->checkNvrReachable($nvr);
 
             if (! $nvrOnline) {
@@ -37,7 +41,6 @@ class CheckCameraStatusJob implements ShouldQueue
                 if ($nvr->status === 'online') {
                     $nvr->update(['status' => 'offline']);
 
-                    // Check for existing unresolved alert
                     $existing = Alert::where('type', 'nvr_disconnected')
                         ->where('source_id', $nvr->id)
                         ->unresolved()
@@ -56,7 +59,7 @@ class CheckCameraStatusJob implements ShouldQueue
             // NVR is online
             $nvr->update(['status' => 'online', 'last_seen_at' => now()]);
 
-            // Check individual cameras via RTSP probe
+            // Check individual cameras via go2rtc probe
             foreach ($nvr->cameras as $camera) {
                 if ($camera->status === 'maintenance' || ! $camera->is_active) {
                     continue;
@@ -101,6 +104,9 @@ class CheckCameraStatusJob implements ShouldQueue
         Log::info('CheckCameraStatusJob: Camera status check completed.');
     }
 
+    /**
+     * Check NVR reachability via RTSP port socket.
+     */
     protected function checkNvrReachable(Nvr $nvr): bool
     {
         $connection = @fsockopen($nvr->ip_address, $nvr->port ?? 554, $errno, $errstr, 3);
@@ -113,28 +119,56 @@ class CheckCameraStatusJob implements ShouldQueue
         return false;
     }
 
+    /**
+     * Check camera stream by temporarily registering it in go2rtc
+     * and verifying the stream has active producers.
+     * No FFmpeg/ffprobe required.
+     */
     protected function checkCameraStream(Camera $camera): bool
     {
-        $ffprobe = config('monc.ffprobe_path', 'ffprobe');
         $streamUrl = $camera->getSubStreamUrl();
+        if (! $streamUrl) {
+            return false;
+        }
 
-        $command = [
-            $ffprobe,
-            '-rtsp_transport', 'tcp',
-            '-i', $streamUrl,
-            '-timeout', '5000000', // 5 seconds in microseconds
-            '-v', 'quiet',
-            '-print_format', 'json',
-            '-show_streams',
-        ];
+        $streamName = "probe_camera_{$camera->id}";
 
         try {
-            $process = new Process($command);
-            $process->setTimeout(10);
-            $process->run();
+            // Register stream in go2rtc
+            $putUrl = "{$this->go2rtcApiUrl}/api/streams?name={$streamName}&src=" . urlencode($streamUrl);
+            $ch = curl_init($putUrl);
+            curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'PUT');
+            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($ch, CURLOPT_TIMEOUT, 5);
+            curl_exec($ch);
+            curl_close($ch);
 
-            return $process->isSuccessful();
+            // Wait briefly for go2rtc to connect
+            usleep(1500000); // 1.5 seconds
+
+            // Check if stream has producers (connected to RTSP source)
+            $response = Http::timeout(5)->get("{$this->go2rtcApiUrl}/api/streams");
+            $streams = $response->json() ?? [];
+
+            $isOnline = false;
+            if (isset($streams[$streamName])) {
+                $producers = $streams[$streamName]['producers'] ?? [];
+                // If producers exist, the stream source is reachable
+                $isOnline = ! empty($producers);
+            }
+
+            // Cleanup: remove the probe stream
+            Http::timeout(3)->delete("{$this->go2rtcApiUrl}/api/streams?name={$streamName}");
+
+            return $isOnline;
         } catch (\Exception $e) {
+            // Cleanup on error
+            try {
+                Http::timeout(3)->delete("{$this->go2rtcApiUrl}/api/streams?name={$streamName}");
+            } catch (\Exception $e2) {
+                // ignore
+            }
+
             return false;
         }
     }

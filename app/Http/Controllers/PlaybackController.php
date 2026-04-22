@@ -3,8 +3,8 @@
 namespace App\Http\Controllers;
 
 use App\Models\ActivityLog;
-use App\Models\Building;
 use App\Models\Camera;
+use App\Services\Go2rtcStreamService;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
@@ -12,6 +12,10 @@ use Illuminate\View\View;
 
 class PlaybackController extends Controller
 {
+    public function __construct(
+        protected Go2rtcStreamService $streamService
+    ) {}
+
     /**
      * Show the playback page with camera selector.
      */
@@ -46,11 +50,13 @@ class PlaybackController extends Controller
             return $camera->building->name ?? 'Unknown';
         });
 
-        return view('playback.index', compact('cameras'));
+        $go2rtcApiUrl = $this->streamService->getApiUrl();
+
+        return view('playback.index', compact('cameras', 'go2rtcApiUrl'));
     }
 
     /**
-     * Build an RTSP playback URL for Hikvision ISAPI and return session info.
+     * Build an RTSP playback URL, register it in go2rtc, and return stream info.
      */
     public function play(Request $request): JsonResponse
     {
@@ -78,8 +84,8 @@ class PlaybackController extends Controller
         $endTime = $validated['end_time'];
 
         // Format timestamps for Hikvision ISAPI: YYYYMMDDTHHmmssZ
-        $startDatetime = str_replace(['-', ':'], '', $date).'T'.str_replace(':', '', $startTime).'Z';
-        $endDatetime = str_replace(['-', ':'], '', $date).'T'.str_replace(':', '', $endTime).'Z';
+        $startFormatted = str_replace(['-', ':'], '', $date) . 'T' . str_replace(':', '', $startTime) . '00Z';
+        $endFormatted = str_replace(['-', ':'], '', $date) . 'T' . str_replace(':', '', $endTime) . '00Z';
 
         // Build RTSP playback URL for Hikvision
         $playbackUrl = sprintf(
@@ -89,9 +95,19 @@ class PlaybackController extends Controller
             $nvr->ip_address,
             $nvr->port ?? 554,
             $camera->channel_no,
-            $startDatetime,
-            $endDatetime
+            $startFormatted,
+            $endFormatted
         );
+
+        // Register the playback RTSP URL in go2rtc
+        $streamName = $this->streamService->startPlaybackStream($camera->id, $playbackUrl);
+
+        if (! $streamName) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Failed to start playback stream. Check go2rtc status.',
+            ], 500);
+        }
 
         ActivityLog::log('playback_requested', "Playback requested for camera '{$camera->name}'", [
             'camera_id' => $camera->id,
@@ -102,21 +118,28 @@ class PlaybackController extends Controller
 
         return response()->json([
             'success' => true,
-            'playback_url' => $playbackUrl,
+            'stream_name' => $streamName,
             'camera_name' => $camera->name,
             'date' => $date,
             'start_time' => $startTime,
             'end_time' => $endTime,
-            'camera' => [
-                'id' => $camera->id,
-                'name' => $camera->name,
-                'channel_no' => $camera->channel_no,
-            ],
-            'nvr' => [
-                'id' => $nvr->id,
-                'name' => $nvr->name,
-                'ip_address' => $nvr->ip_address,
-            ],
+        ]);
+    }
+
+    /**
+     * Stop a playback stream.
+     */
+    public function stop(Request $request): JsonResponse
+    {
+        $validated = $request->validate([
+            'camera_id' => ['required', 'exists:cameras,id'],
+        ]);
+
+        $this->streamService->stopPlaybackStream($validated['camera_id']);
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Playback stream stopped.',
         ]);
     }
 }

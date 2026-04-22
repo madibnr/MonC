@@ -149,4 +149,17 @@ class LiveViewController extends Controller
             'stream_url' => $streamUrl,
         ]);
     }
+
+    /**
+     * Ensure go2rtc is running (auto-start if needed).
+     */
+    public function ensureGo2rtc(): JsonResponse
+    {
+        $started = $this->streamService->ensureRunning();
+
+        return response()->json([
+            'success' => $started,
+            'message' => $started ? 'go2rtc is running.' : 'Failed to start go2rtc.',
+        ]);
+    }
 }

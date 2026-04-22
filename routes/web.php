@@ -64,6 +64,7 @@ Route::middleware(['auth', 'auth.monc'])->group(function () {
     */
     Route::prefix('live')->name('live.')->group(function () {
         Route::get('/', [LiveViewController::class, 'index'])->name('index');
+        Route::post('/go2rtc-start', [LiveViewController::class, 'ensureGo2rtc'])->name('go2rtc.start');
         Route::post('/stream/{camera}', [LiveViewController::class, 'stream'])->name('stream.start');
         Route::delete('/stream/{camera}', [LiveViewController::class, 'stopStream'])->name('stream.stop');
         Route::get('/stream/{camera}/status', [LiveViewController::class, 'streamStatus'])->name('stream.status');
@@ -77,6 +78,7 @@ Route::middleware(['auth', 'auth.monc'])->group(function () {
     Route::prefix('playback')->name('playback.')->group(function () {
         Route::get('/', [PlaybackController::class, 'index'])->name('index');
         Route::post('/play', [PlaybackController::class, 'play'])->name('play');
+        Route::delete('/stop', [PlaybackController::class, 'stop'])->name('stop');
     });
 
     /*
@@ -86,6 +88,7 @@ Route::middleware(['auth', 'auth.monc'])->group(function () {
     */
     Route::middleware(['role:superadmin,admin_it'])->group(function () {
         Route::resource('cameras', CameraController::class);
+        Route::post('/cameras/{camera}/check-status', [CameraController::class, 'checkStatus'])->name('cameras.check-status');
     });
 
     /*
@@ -153,6 +156,7 @@ Route::middleware(['auth', 'auth.monc'])->group(function () {
     Route::prefix('exports')->name('exports.')->group(function () {
         Route::get('/', [ClipExportController::class, 'index'])->name('index');
         Route::post('/', [ClipExportController::class, 'store'])->name('store');
+        Route::get('/queue-status', [ClipExportController::class, 'queueStatus'])->name('queue-status');
         Route::get('/{clipExport}/status', [ClipExportController::class, 'status'])->name('status');
         Route::get('/{clipExport}/download', [ClipExportController::class, 'download'])->name('download');
         Route::delete('/{clipExport}', [ClipExportController::class, 'destroy'])->name('destroy');

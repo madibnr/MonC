@@ -135,23 +135,23 @@ class Go2rtcStreamService
             return null;
         }
 
-        // Check for existing active session
+        $streamName = $this->getStreamName($camera->id, $streamType);
+
+        // Check for existing active session with same stream type
         $existingSession = StreamSession::where('camera_id', $camera->id)
             ->where('status', 'active')
+            ->where('stream_path', $streamName)
             ->first();
 
         if ($existingSession) {
-            $expectedName = $this->getStreamName($camera->id, $streamType);
-            if ($existingSession->stream_path === $expectedName) {
-                return $existingSession;
-            }
-            // Different stream type requested, stop existing
-            $this->stopStream($camera->id);
+            return $existingSession;
         }
 
-        $this->cleanupStaleSessions($camera->id);
+        // Different stream type requested — stop existing
+        StreamSession::where('camera_id', $camera->id)
+            ->whereIn('status', ['active', 'starting'])
+            ->update(['status' => 'stopped', 'stopped_at' => now()]);
 
-        $streamName = $this->getStreamName($camera->id, $streamType);
         $rtspUrl = $streamType === 'main'
             ? $camera->getMainStreamUrl()
             : $camera->getSubStreamUrl();
@@ -167,46 +167,25 @@ class Go2rtcStreamService
             'camera_id' => $camera->id,
             'user_id' => $userId,
             'stream_path' => $streamName,
-            'status' => 'starting',
+            'status' => 'active',
             'started_at' => now(),
         ]);
 
         try {
             // go2rtc v1.9 API: PUT /api/streams?name=NAME&src=RTSP_URL
-            // The src must be in the query parameter, not in the body.
             $encodedSrc = urlencode($rtspUrl);
             $putUrl = "{$this->apiUrl}/api/streams?name={$streamName}&src={$encodedSrc}";
 
-            // Use native curl because go2rtc may return 400 but still register the stream
             $ch = curl_init($putUrl);
             curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'PUT');
             curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-            curl_setopt($ch, CURLOPT_TIMEOUT, 10);
+            curl_setopt($ch, CURLOPT_TIMEOUT, 5);
             curl_exec($ch);
-            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
             curl_close($ch);
 
-            // Verify the stream was registered (go2rtc may return 400 but still succeed)
-            sleep(1);
-            $checkResponse = Http::timeout(5)->get("{$this->apiUrl}/api/streams");
-            $streams = $checkResponse->json() ?? [];
-
-            if (! isset($streams[$streamName])) {
-                Log::error("Stream {$streamName} not found in go2rtc after PUT (HTTP {$httpCode})");
-
-                $session->update([
-                    'status' => 'error',
-                    'error_message' => "Stream not registered in go2rtc (HTTP {$httpCode})",
-                    'stopped_at' => now(),
-                ]);
-
-                return null;
-            }
-
-            $session->update([
-                'status' => 'active',
-                'pid' => null, // go2rtc manages its own processes
-            ]);
+            // No sleep, no verification — go2rtc registers streams instantly.
+            // The WebSocket client will connect and go2rtc will start the
+            // RTSP producer on-demand when the first consumer connects.
 
             Log::info("Stream started via go2rtc for camera {$camera->id}: {$streamName}");
 
@@ -298,6 +277,75 @@ class Go2rtcStreamService
         }
 
         return null;
+    }
+
+    // ── Playback Stream Management ─────────────────────────────────
+
+    /**
+     * Start a playback stream by registering a custom RTSP URL in go2rtc.
+     * Returns the stream name on success, null on failure.
+     */
+    public function startPlaybackStream(int $cameraId, string $rtspUrl): ?string
+    {
+        if (! $this->ensureRunning()) {
+            Log::error("go2rtc is not running, cannot start playback stream for camera {$cameraId}");
+
+            return null;
+        }
+
+        $streamName = "playback_camera_{$cameraId}";
+
+        // Remove existing playback stream if any
+        $this->stopPlaybackStream($cameraId);
+
+        try {
+            $encodedSrc = urlencode($rtspUrl);
+            $putUrl = "{$this->apiUrl}/api/streams?name={$streamName}&src={$encodedSrc}";
+
+            $ch = curl_init($putUrl);
+            curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'PUT');
+            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($ch, CURLOPT_TIMEOUT, 10);
+            curl_exec($ch);
+            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+            curl_close($ch);
+
+            // Verify the stream was registered
+            sleep(1);
+            $checkResponse = Http::timeout(5)->get("{$this->apiUrl}/api/streams");
+            $streams = $checkResponse->json() ?? [];
+
+            if (! isset($streams[$streamName])) {
+                Log::error("Playback stream {$streamName} not found in go2rtc after PUT (HTTP {$httpCode})");
+
+                return null;
+            }
+
+            Log::info("Playback stream started via go2rtc for camera {$cameraId}: {$streamName}");
+
+            return $streamName;
+        } catch (\Exception $e) {
+            Log::error("Failed to start playback stream for camera {$cameraId}: {$e->getMessage()}");
+
+            return null;
+        }
+    }
+
+    /**
+     * Stop a playback stream for a camera.
+     */
+    public function stopPlaybackStream(int $cameraId): bool
+    {
+        $streamName = "playback_camera_{$cameraId}";
+
+        try {
+            Http::timeout(5)->delete("{$this->apiUrl}/api/streams?name={$streamName}");
+            Log::info("Playback stream stopped for camera {$cameraId}: {$streamName}");
+        } catch (\Exception $e) {
+            Log::warning("Failed to remove playback stream {$streamName}: {$e->getMessage()}");
+        }
+
+        return true;
     }
 
     // ── URL Builders ────────────────────────────────────────────────
