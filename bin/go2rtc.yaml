@@ -1,0 +1,17 @@
+# go2rtc configuration for MonC
+# Streams are managed dynamically via the go2rtc API from Laravel
+
+api:
+  listen: ":1984"
+  origin: "*"
+
+rtsp:
+  listen: ":8554"
+
+webrtc:
+  listen: ":8555"
+  candidates:
+    - stun:stun.l.google.com:19302
+
+# Streams will be added dynamically via API
+streams: {}

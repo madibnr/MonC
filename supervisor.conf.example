@@ -1,0 +1,16 @@
+# Supervisor Configuration for MONC Queue Worker
+# Place this in: /etc/supervisor/conf.d/monc-queue-worker.conf
+# Or add via aaPanel → Supervisor
+
+[program:monc-queue-worker]
+process_name=%(program_name)s_%(process_num)02d
+command=/usr/bin/php /www/wwwroot/monc.yourdomain.com/artisan queue:work --sleep=3 --tries=3 --max-time=3600 --timeout=120
+autostart=true
+autorestart=true
+stopasgroup=true
+killasgroup=true
+user=www
+numprocs=1
+redirect_stderr=true
+stdout_logfile=/tmp/monc-queue-worker.log
+stopwaitsecs=3600
